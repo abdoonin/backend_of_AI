@@ -2,6 +2,14 @@ import os
 os.environ.setdefault("DATABASE_URL", "sqlite:///./medical_ai.db")
 os.environ.setdefault("ENVIRONMENT", "production")
 
+# Ensure backwards compatibility for older pickled pipelines
+try:
+    import sklearn.compose._column_transformer as ct
+    if not hasattr(ct, '_RemainderColsList'):
+        ct._RemainderColsList = list
+except Exception:
+    pass
+
 import gradio as gr
 import uvicorn
 from main import app as fastapi_app

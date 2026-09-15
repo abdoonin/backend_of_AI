@@ -8,19 +8,26 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Database configuration
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://username:password@localhost:5432/medical_ai_db")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./medical_ai.db")
 print(f"Loaded DATABASE_URL: {DATABASE_URL}")
 
 # Create SQLAlchemy engine
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=20,
-    pool_timeout=10,
-    pool_recycle=300,
-    echo=False
-)
+if DATABASE_URL.startswith("sqlite"):
+    engine = create_engine(
+        DATABASE_URL,
+        connect_args={"check_same_thread": False},
+        pool_pre_ping=True
+    )
+else:
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,
+        pool_size=10,
+        max_overflow=20,
+        pool_timeout=10,
+        pool_recycle=300,
+        echo=False
+    )
 
 # Enable foreign key enforcement for SQLite
 if DATABASE_URL.startswith("sqlite"):

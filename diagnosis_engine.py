@@ -23,6 +23,16 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Ensure backwards compatibility for older pickled pipelines
+try:
+    import sklearn.compose._column_transformer as ct
+    if not hasattr(ct, '_RemainderColsList'):
+        class _RemainderColsList(list):
+            pass
+        ct._RemainderColsList = _RemainderColsList
+except Exception:
+    pass
+
 class DiagnosisEngine:
     """
     Smart Dispatcher: Routes data from master profile to appropriate ML models.

@@ -69,7 +69,11 @@ async def validation_exception_handler(request, exc):
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001"],  # Next.js dev server
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:3001",
+    ],
+    allow_origin_regex=r"https?://.*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

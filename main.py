@@ -206,7 +206,8 @@ async def analyze_patient(user_profile: dict, db: Session = Depends(get_db), cur
                         diagnosis=diagnosis,
                         confidence=confidence,
                         advice=advice,
-                        risk_level=db_risk_level
+                        risk_level=db_risk_level,
+                        detailed_results=json.dumps(detailed_results)
                     )
                     db.add(medical_report)
                     db.commit()
@@ -812,6 +813,16 @@ async def update_patient_analysis(analysis_id: int, analysis_data: dict, db: Ses
             analysis.confidence = analysis_data["confidence"]
         if "advice" in analysis_data:
             analysis.advice = analysis_data["advice"]
+        if "risk_level" in analysis_data:
+            analysis.risk_level = analysis_data["risk_level"]
+        if "detailed_results" in analysis_data:
+            val = analysis_data["detailed_results"]
+            analysis.detailed_results = json.dumps(val) if isinstance(val, (dict, list)) else str(val)
+        if "created_at" in analysis_data and analysis_data["created_at"]:
+            try:
+                analysis.created_at = datetime.fromisoformat(analysis_data["created_at"])
+            except Exception:
+                pass
         if "patient_id" in analysis_data:
             # Verify that the patient exists
             patient = db.query(Patient).filter(Patient.id == analysis_data["patient_id"]).first()

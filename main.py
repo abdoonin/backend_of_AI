@@ -83,6 +83,18 @@ try:
             conn.execute(text("ALTER TABLE patients ADD COLUMN chronic_conditions TEXT"))
             conn.commit()
             print("Migrated: added chronic_conditions column to patients table")
+
+        user_res = conn.execute(text("PRAGMA table_info(users)")).fetchall()
+        user_cols = [r[1] for r in user_res]
+        if "subscription_plan" not in user_cols:
+            conn.execute(text("ALTER TABLE users ADD COLUMN subscription_plan VARCHAR(50) DEFAULT 'monthly'"))
+        if "subscription_months" not in user_cols:
+            conn.execute(text("ALTER TABLE users ADD COLUMN subscription_months INTEGER DEFAULT 1"))
+        if "subscription_price" not in user_cols:
+            conn.execute(text("ALTER TABLE users ADD COLUMN subscription_price FLOAT DEFAULT 20.0"))
+        if "subscription_expires_at" not in user_cols:
+            conn.execute(text("ALTER TABLE users ADD COLUMN subscription_expires_at DATETIME"))
+        conn.commit()
 except Exception as e:
     print(f"Migration notice: {e}")
 
@@ -904,6 +916,9 @@ class RegisterRequest(BaseModel):
     full_name: Optional[str] = None
     role: Optional[str] = "user"
     permissions: Optional[Dict[str, bool]] = None
+    subscription_plan: Optional[str] = "monthly"
+    subscription_months: Optional[int] = 1
+    subscription_price: Optional[float] = 20.0
 
 
 @app.post("/auth/login")
@@ -1031,6 +1046,10 @@ async def register_user(
     if (body.role or "user") != "admin":
         perms["can_access_admin"] = False
 
+    from datetime import timedelta
+    sub_months = body.subscription_months or 1
+    sub_expires = datetime.utcnow() + timedelta(days=sub_months * 30)
+
     new_user = User(
         username=body.username,
         email=body.email,
@@ -1039,6 +1058,10 @@ async def register_user(
         role=body.role or "user",
         is_active=1,
         permissions=json.dumps(perms),
+        subscription_plan=body.subscription_plan or "monthly",
+        subscription_months=sub_months,
+        subscription_price=body.subscription_price if body.subscription_price is not None else 20.0,
+        subscription_expires_at=sub_expires,
     )
     db.add(new_user)
     db.commit()
@@ -1058,6 +1081,10 @@ async def register_user(
             "fullName": new_user.full_name,
             "role": new_user.role,
             "permissions": new_user.get_permissions(),
+            "subscriptionPlan": new_user.subscription_plan,
+            "subscriptionMonths": new_user.subscription_months,
+            "subscriptionPrice": new_user.subscription_price,
+            "subscriptionExpiresAt": new_user.subscription_expires_at.isoformat() if new_user.subscription_expires_at else None,
         },
     }
 
@@ -1084,6 +1111,10 @@ async def admin_list_users(
                 "role": u.role,
                 "isActive": bool(u.is_active),
                 "permissions": u.get_permissions(),
+                "subscriptionPlan": getattr(u, "subscription_plan", "monthly") or "monthly",
+                "subscriptionMonths": getattr(u, "subscription_months", 1) or 1,
+                "subscriptionPrice": getattr(u, "subscription_price", 20.0) or 20.0,
+                "subscriptionExpiresAt": u.subscription_expires_at.isoformat() if getattr(u, "subscription_expires_at", None) else None,
                 "lastLogin": u.last_login.isoformat() if u.last_login else None,
                 "createdAt": u.created_at.isoformat() if u.created_at else None,
             }
@@ -1121,6 +1152,14 @@ async def admin_update_user(
         user.permissions = json.dumps(user_data["permissions"])
     if "password" in user_data and user_data["password"]:
         user.hashed_password = hash_password(user_data["password"])
+    if "subscription_plan" in user_data:
+        user.subscription_plan = user_data["subscription_plan"]
+    if "subscription_months" in user_data:
+        user.subscription_months = int(user_data["subscription_months"])
+        from datetime import timedelta
+        user.subscription_expires_at = datetime.utcnow() + timedelta(days=user.subscription_months * 30)
+    if "subscription_price" in user_data:
+        user.subscription_price = float(user_data["subscription_price"])
 
     db.commit()
     db.refresh(user)
@@ -1140,6 +1179,10 @@ async def admin_update_user(
             "role": user.role,
             "isActive": bool(user.is_active),
             "permissions": user.get_permissions(),
+            "subscriptionPlan": getattr(user, "subscription_plan", "monthly"),
+            "subscriptionMonths": getattr(user, "subscription_months", 1),
+            "subscriptionPrice": getattr(user, "subscription_price", 20.0),
+            "subscriptionExpiresAt": user.subscription_expires_at.isoformat() if getattr(user, "subscription_expires_at", None) else None,
         },
     }
 

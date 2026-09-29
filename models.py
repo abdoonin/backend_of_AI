@@ -312,6 +312,10 @@ class User(Base):
     role            = Column(String(20), nullable=False, default="user")  # label only
     is_active       = Column(Integer, nullable=False, default=1)  # 0=disabled, 1=active
     permissions     = Column(Text, nullable=False, default=_json.dumps(DEFAULT_PERMISSIONS))
+    subscription_plan    = Column(String(50), nullable=True, default="monthly")
+    subscription_months  = Column(Integer, nullable=True, default=1)
+    subscription_price   = Column(Float, nullable=True, default=20.0)
+    subscription_expires_at = Column(DateTime(timezone=True), nullable=True)
     last_login      = Column(DateTime(timezone=True), nullable=True)
     created_at      = Column(DateTime(timezone=True), server_default=func.now())
     updated_at      = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

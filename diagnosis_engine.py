@@ -114,10 +114,47 @@ class DiagnosisEngine:
             'hepatitis_status': 'hepatitisC_status_model.pkl'
         }
 
+        # Backward compatibility shim for unpickling models created with scikit-learn 1.6
+        try:
+            import sklearn.compose._column_transformer as ct
+            if not hasattr(ct, '_RemainderColsList'):
+                class _RemainderColsList(list):
+                    pass
+                ct._RemainderColsList = _RemainderColsList
+        except Exception:
+            pass
+
+        import inspect
+        import xgboost
+
+        def _patch_estimator(estimator):
+            if estimator is None:
+                return
+            for cls in [getattr(xgboost, 'XGBClassifier', None), getattr(xgboost, 'XGBModel', None)]:
+                if cls and isinstance(estimator, cls):
+                    try:
+                        sig = inspect.signature(cls.__init__)
+                        for p in sig.parameters.values():
+                            if p.name not in ('self', 'kwargs') and not hasattr(estimator, p.name):
+                                setattr(estimator, p.name, p.default if p.default != inspect.Parameter.empty else None)
+                        if hasattr(estimator, 'n_classes_') and not hasattr(estimator, 'classes_'):
+                            import numpy as np
+                            estimator.classes_ = np.arange(estimator.n_classes_)
+                    except Exception:
+                        pass
+            if hasattr(estimator, 'steps'):
+                for _, step_est in estimator.steps:
+                    _patch_estimator(step_est)
+            if hasattr(estimator, 'named_steps'):
+                for step_est in estimator.named_steps.values():
+                    _patch_estimator(step_est)
+
         for model_name, filename in model_files.items():
             model_path = os.path.join(model_dir, filename)
             try:
-                self.models[model_name] = joblib.load(model_path)
+                model = joblib.load(model_path)
+                _patch_estimator(model)
+                self.models[model_name] = model
                 logger.info(f"Loaded {model_name} model successfully")
             except Exception as e:
                 logger.error(f"Failed to load {model_name} model: {e}")

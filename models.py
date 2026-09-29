@@ -17,6 +17,9 @@ DEFAULT_PERMISSIONS = {
     "can_edit_patients":   False,
     "can_delete_patients": False,
     "can_view_records":    False,
+    "can_manage_prescriptions": False,
+    "can_manage_clinical_notes": False,
+    "can_manage_billing":  False,
     "can_manage_users":    False,
     "can_view_audit_logs": False,
     "can_access_admin":    False,
@@ -34,6 +37,9 @@ DOCTOR_PRESET_PERMISSIONS = {
     "can_edit_patients":   True,
     "can_delete_patients": False,
     "can_view_records":    True,
+    "can_manage_prescriptions": True,
+    "can_manage_clinical_notes": True,
+    "can_manage_billing":  True,
     "can_manage_users":    False,
     "can_view_audit_logs": False,
     "can_access_admin":    False,
@@ -57,6 +63,7 @@ class Patient(Base):
     doctor_name = Column(String(255), nullable=True)  # Attending physician/supervisor
     doctor_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # Owning doctor
     status = Column(String(20), nullable=False, default="active")  # active, archived
+    chronic_conditions = Column(Text, nullable=True)  # JSON array of chronic illnesses
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -64,6 +71,10 @@ class Patient(Base):
     doctor = relationship("User", foreign_keys=[doctor_id], back_populates="patients")
     lab_tests = relationship("LabTest", back_populates="patient", cascade="all, delete-orphan")
     medical_reports = relationship("MedicalReport", back_populates="patient", cascade="all, delete-orphan")
+    prescriptions = relationship("Prescription", back_populates="patient", cascade="all, delete-orphan")
+    clinical_notes = relationship("ClinicalNote", back_populates="patient", cascade="all, delete-orphan")
+    ultrasound_exams = relationship("UltrasoundExam", back_populates="patient", cascade="all, delete-orphan")
+    billing_records = relationship("ClinicBilling", back_populates="patient", cascade="all, delete-orphan")
 
 class LabTest(Base):
     __tablename__ = "lab_tests"
@@ -102,6 +113,191 @@ class MedicalReport(Base):
     patient = relationship("Patient", back_populates="medical_reports")
 
 # ─────────────────────────────────────────────────────────
+# E-Prescription Models (المرحلة 1: نظام الوصفات الطبية)
+# ─────────────────────────────────────────────────────────
+
+class Medication(Base):
+    __tablename__ = "medications"
+
+    id             = Column(Integer, primary_key=True, index=True)
+    trade_name     = Column(String(255), nullable=False, index=True)
+    generic_name   = Column(String(255), nullable=False, index=True)
+    category       = Column(String(100), nullable=True)  # e.g., Hepatology, Diuretics, Antivirals
+    dosage_forms   = Column(Text, nullable=True)         # JSON list e.g. ["250mg capsule", "500mg tablet"]
+    default_dose   = Column(String(100), nullable=True)
+    default_freq   = Column(String(100), nullable=True)  # e.g., TDS, BID, QD
+    timing         = Column(String(100), nullable=True)  # after_meal, before_meal, bedtime
+    notes_ar       = Column(Text, nullable=True)         # تعليمات الاستعمال بالعربية
+    liver_warning  = Column(Text, nullable=True)         # تحذير لمرضى التليف/القصور الكبدي
+    is_liver_safe  = Column(Integer, default=1)          # 1=آمن، 0=يحتاج حذر أو ممنوع في الفشل الكبدي
+    common_in_iraq = Column(Integer, default=1)          # 1=شائع في الصيدليات العراقية
+    created_at     = Column(DateTime(timezone=True), server_default=func.now())
+
+class Prescription(Base):
+    __tablename__ = "prescriptions"
+
+    id                  = Column(Integer, primary_key=True, index=True)
+    prescription_number = Column(String(50), unique=True, nullable=False, index=True)
+    patient_id          = Column(Integer, ForeignKey("patients.id"), nullable=False)
+    doctor_id           = Column(Integer, ForeignKey("users.id"), nullable=True)
+    diagnosis           = Column(String(500), nullable=True)
+    notes               = Column(Text, nullable=True)
+    follow_up_date      = Column(String(100), nullable=True)
+    status              = Column(String(20), nullable=False, default="active")  # active, completed, cancelled
+    created_at          = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at          = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    # Relationships
+    patient = relationship("Patient", back_populates="prescriptions")
+    doctor  = relationship("User", foreign_keys=[doctor_id], back_populates="prescriptions")
+    items   = relationship("PrescriptionItem", back_populates="prescription", cascade="all, delete-orphan")
+
+class PrescriptionItem(Base):
+    __tablename__ = "prescription_items"
+
+    id              = Column(Integer, primary_key=True, index=True)
+    prescription_id = Column(Integer, ForeignKey("prescriptions.id"), nullable=False)
+    medication_id   = Column(Integer, ForeignKey("medications.id"), nullable=True)
+    medication_name = Column(String(255), nullable=False)
+    generic_name    = Column(String(255), nullable=True)
+    dose            = Column(String(100), nullable=False)
+    frequency       = Column(String(100), nullable=False)
+    timing          = Column(String(100), nullable=True)
+    duration        = Column(String(100), nullable=True)
+    instructions_ar = Column(Text, nullable=True)
+    created_at      = Column(DateTime(timezone=True), server_default=func.now())
+
+    # Relationships
+    prescription = relationship("Prescription", back_populates="items")
+    medication   = relationship("Medication")
+
+# ─────────────────────────────────────────────────────────
+# Phase 3: Clinical Notes (SOAP) & Follow-up Tracking
+# ─────────────────────────────────────────────────────────
+
+class ClinicalNote(Base):
+    __tablename__ = "clinical_notes"
+
+    id                  = Column(Integer, primary_key=True, index=True)
+    patient_id          = Column(Integer, ForeignKey("patients.id"), nullable=False)
+    doctor_id           = Column(Integer, ForeignKey("users.id"), nullable=True)
+    visit_date          = Column(DateTime(timezone=True), server_default=func.now())
+    visit_type          = Column(String(50), nullable=False, default="follow_up") # new, follow_up, routine
+
+    # SOAP components
+    subjective          = Column(Text, nullable=True) # Chief complaint & history
+    objective           = Column(Text, nullable=True) # Physical examination findings
+    assessment          = Column(Text, nullable=True) # Clinical assessment & diagnosis
+    plan                = Column(Text, nullable=True) # Diagnostic & therapeutic plan
+
+    # Vital Signs
+    blood_pressure      = Column(String(50), nullable=True) # e.g. "120/80"
+    heart_rate          = Column(Integer, nullable=True)    # bpm
+    weight              = Column(Float, nullable=True)      # kg
+    temperature         = Column(Float, nullable=True)      # °C
+
+    # Liver-Specific Physical Signs
+    jaundice            = Column(String(50), nullable=True) # None, Mild, Moderate, Severe
+    ascites             = Column(String(50), nullable=True) # None, Mild, Moderate, Tense
+    edema               = Column(String(50), nullable=True) # None, Mild (+1), Moderate (+2), Severe (+3)
+    hepatomegaly        = Column(Integer, default=0)        # 0=No, 1=Yes
+    splenomegaly        = Column(Integer, default=0)        # 0=No, 1=Yes
+    spider_angioma      = Column(Integer, default=0)        # 0=No, 1=Yes
+    asterixis           = Column(Integer, default=0)        # 0=No, 1=Yes (Encephalopathy flap)
+
+    follow_up_date      = Column(String(100), nullable=True)
+    created_at          = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at          = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    # Relationships
+    patient = relationship("Patient", back_populates="clinical_notes")
+    doctor  = relationship("User", foreign_keys=[doctor_id], back_populates="clinical_notes")
+
+# ─────────────────────────────────────────────────────────
+# Phase 5: Liver Ultrasound, Imaging & FibroScan Documentation
+# ─────────────────────────────────────────────────────────
+
+class UltrasoundExam(Base):
+    __tablename__ = "ultrasound_exams"
+
+    id                  = Column(Integer, primary_key=True, index=True)
+    patient_id          = Column(Integer, ForeignKey("patients.id"), nullable=False)
+    doctor_id           = Column(Integer, ForeignKey("users.id"), nullable=True)
+    exam_date           = Column(DateTime(timezone=True), server_default=func.now())
+    exam_type           = Column(String(50), nullable=False, default="ultrasound") # ultrasound, fibroscan, ct, mri
+
+    # Liver Parenchyma & Dimensions
+    liver_size          = Column(String(50), nullable=True, default="Normal") # Normal, Hepatomegaly, Shrunken / Atrophic
+    echogenicity        = Column(String(50), nullable=True, default="Normal") # Normal, Grade I Mild Fatty, Grade II Moderate Fatty, Grade III Severe Fatty, Coarse / Cirrhotic
+    surface_contour     = Column(String(50), nullable=True, default="Smooth") # Smooth, Irregular / Nodular
+
+    # Vascular & Portal System
+    portal_vein_mm      = Column(Float, nullable=True) # mm, normal < 13
+    portal_flow         = Column(String(50), nullable=True, default="Normal") # Normal, Slowed, Hepatofugal, Thrombosis
+    spleen_size_cm      = Column(Float, nullable=True) # cm, normal < 12-13
+
+    # Complications & Lesions
+    ascites             = Column(String(50), nullable=True, default="None") # None, Mild, Moderate, Severe
+    focal_lesion        = Column(String(50), nullable=True, default="None") # None, Cyst, Hemangioma, Suspicious HCC, Multiple Nodules
+    focal_lesion_desc   = Column(Text, nullable=True)
+
+    # Biliary Tree
+    gallbladder         = Column(String(50), nullable=True, default="Normal") # Normal, Stones, Sludge, Thickened Wall, Removed
+    cbd_diameter_mm     = Column(Float, nullable=True) # mm, normal < 6-7
+
+    # FibroScan / Elastography (optional)
+    fibroscan_kpa       = Column(Float, nullable=True) # Liver stiffness in kPa
+    fibroscan_cap       = Column(Float, nullable=True) # Controlled Attenuation Parameter in dB/m
+    fibrosis_stage      = Column(String(20), nullable=True) # F0, F1, F2, F3, F4
+    steatosis_grade     = Column(String(20), nullable=True) # S0, S1, S2, S3
+
+    # Summary & Recommendations
+    impression          = Column(Text, nullable=True)
+    recommendations     = Column(Text, nullable=True)
+    image_urls          = Column(Text, nullable=True) # JSON array of image URLs/paths
+
+    created_at          = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at          = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    # Relationships
+    patient = relationship("Patient", back_populates="ultrasound_exams")
+    doctor  = relationship("User", foreign_keys=[doctor_id], back_populates="ultrasound_exams")
+
+# ─────────────────────────────────────────────────────────
+# Clinic Billing & Finance Models (المرحلة 6: إدارة الكشفيات والمالية)
+# ─────────────────────────────────────────────────────────
+
+class ClinicBilling(Base):
+    __tablename__ = "clinic_billing"
+
+    id             = Column(Integer, primary_key=True, index=True)
+    bill_number    = Column(String(50), unique=True, nullable=False, index=True) # e.g. INV-2026-0001
+    patient_id     = Column(Integer, ForeignKey("patients.id"), nullable=False)
+    doctor_id      = Column(Integer, ForeignKey("users.id"), nullable=True)
+    doctor_name    = Column(String(255), nullable=True)
+    patient_name   = Column(String(255), nullable=True)
+    patient_code   = Column(String(50), nullable=True)
+
+    visit_date     = Column(DateTime(timezone=True), nullable=False)
+    visit_type     = Column(String(50), nullable=False, default="new_consultation")
+    # Options: new_consultation, follow_up, ultrasound, fibroscan, procedure, free_exempt
+
+    fee_iqd        = Column(Integer, nullable=False, default=25000)
+    discount_iqd   = Column(Integer, nullable=False, default=0)
+    final_iqd      = Column(Integer, nullable=False, default=25000)
+
+    is_paid        = Column(Integer, nullable=False, default=1)  # 1=paid, 0=pending/unpaid
+    payment_method = Column(String(50), nullable=False, default="cash") # cash, card, free, installment
+    notes          = Column(Text, nullable=True)
+
+    created_at     = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at     = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    # Relationships
+    patient = relationship("Patient", back_populates="billing_records")
+    doctor  = relationship("User", foreign_keys=[doctor_id], back_populates="billing_records")
+
+# ─────────────────────────────────────────────────────────
 # Auth Models
 # ─────────────────────────────────────────────────────────
 
@@ -123,6 +319,10 @@ class User(Base):
     # Relationships
     patients = relationship("Patient", back_populates="doctor", foreign_keys="Patient.doctor_id")
     medical_reports = relationship("MedicalReport", back_populates="doctor", foreign_keys="MedicalReport.doctor_id")
+    prescriptions = relationship("Prescription", back_populates="doctor", foreign_keys="Prescription.doctor_id")
+    clinical_notes = relationship("ClinicalNote", back_populates="doctor", foreign_keys="ClinicalNote.doctor_id")
+    ultrasound_exams = relationship("UltrasoundExam", back_populates="doctor", foreign_keys="UltrasoundExam.doctor_id")
+    billing_records = relationship("ClinicBilling", back_populates="doctor", foreign_keys="ClinicBilling.doctor_id")
     audit_logs = relationship("AuditLog", back_populates="user", cascade="all, delete-orphan")
 
     def get_permissions(self) -> dict:

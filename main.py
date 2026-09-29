@@ -1,9 +1,24 @@
+import sys
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+if hasattr(sys.stderr, 'reconfigure'):
+    try:
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import os
+import shutil
+import uuid
 from dotenv import load_dotenv
 from typing import Optional, List, Union, Any, Dict
 import json
@@ -16,7 +31,7 @@ load_dotenv()
 
 from diagnosis_engine import DiagnosisEngine
 from database import get_db, engine, Base
-from models import Patient, LabTest, MedicalReport, User, AuditLog, ALL_PERMISSIONS, DEFAULT_PERMISSIONS, DOCTOR_PRESET_PERMISSIONS
+from models import Patient, LabTest, MedicalReport, User, AuditLog, Medication, Prescription, PrescriptionItem, ClinicalNote, UltrasoundExam, ClinicBilling, ALL_PERMISSIONS, DEFAULT_PERMISSIONS, DOCTOR_PRESET_PERMISSIONS
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, func
 from auth import (
@@ -58,6 +73,19 @@ print("Backend server starting with updated analysis saving functionality...")
 # Create database tables
 Base.metadata.create_all(bind=engine)
 
+# Safe SQLite migrations for columns added to existing tables
+try:
+    with engine.connect() as conn:
+        from sqlalchemy import text
+        res = conn.execute(text("PRAGMA table_info(patients)")).fetchall()
+        col_names = [r[1] for r in res]
+        if "chronic_conditions" not in col_names:
+            conn.execute(text("ALTER TABLE patients ADD COLUMN chronic_conditions TEXT"))
+            conn.commit()
+            print("Migrated: added chronic_conditions column to patients table")
+except Exception as e:
+    print(f"Migration notice: {e}")
+
 # Initialize FastAPI app
 app = FastAPI(title="Medical AI Backend", version="1.0.0")
 
@@ -78,6 +106,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Uploads directory for imaging / ultrasound scans
+UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
+os.makedirs(os.path.join(UPLOAD_DIR, "imaging"), exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # Pydantic models
 class LabValues(BaseModel):
@@ -341,15 +374,11 @@ async def create_report(report: SaveReportRequest, db: Session = Depends(get_db)
 @app.get("/patient-data")
 async def get_patient_data(db: Session = Depends(get_db), current_user: User = require_permission("can_view_patients")):
     try:
-        print(f"DATABASE_URL in endpoint: {os.getenv('DATABASE_URL')}")
         # Get the first patient scoped to this doctor
         query = db.query(Patient)
         if not _is_admin(current_user):
             query = query.filter(Patient.doctor_id == current_user.id)
         patient = query.first()
-        print(f"Patient found: {patient}")
-        print(f"Patient name: {patient.name if patient else 'None'}")
-        print(f"Patient ID: {patient.id if patient else 'None'}")
 
         if not patient:
             # Return mock data if no patients in database
@@ -487,6 +516,7 @@ async def get_patients(request: Request, db: Session = Depends(get_db), current_
                 "department": patient.department,
                 "doctor_name": patient.doctor_name,
                 "status": patient.status,
+                "chronic_conditions": patient.chronic_conditions,
                 "created_at": patient.created_at.isoformat() if patient.created_at else None,
                 "updated_at": patient.updated_at.isoformat() if patient.updated_at else None,
             }
@@ -599,6 +629,9 @@ async def update_patient(patient_id: str, patient_data: dict = None, db: Session
             patient.department = patient_data["department"]
         if "doctor_name" in patient_data:
             patient.doctor_name = patient_data["doctor_name"]
+        if "chronic_conditions" in patient_data:
+            c_val = patient_data["chronic_conditions"]
+            patient.chronic_conditions = json.dumps(c_val) if isinstance(c_val, (list, dict)) else c_val
 
         db.commit()
         db.refresh(patient)
@@ -738,17 +771,11 @@ async def get_patient_analyses(request: Request, db: Session = Depends(get_db), 
 
         analyses = query.order_by(desc(MedicalReport.created_at)).all()
 
-        print(f"Found {len(analyses)} analyses (include_archived={include_archived})")
-
         # Convert to response format
         analyses_response = []
         for analysis in analyses:
             # Explicitly fetch the patient
             patient = db.query(Patient).filter(Patient.id == analysis.patient_id).first()
-
-            print(f"Analysis {analysis.id}: patient_id={analysis.patient_id}, patient_found={patient is not None}")
-            if patient:
-                print(f"  Patient: {patient.name}, dept={patient.department}, doctor={patient.doctor_name}")
 
             # Calculate risk level if not set
             risk_level = analysis.risk_level
@@ -1342,6 +1369,8 @@ async def admin_assign_patient(
 
     # Audit
     client_ip = request.client.host if request.client else None
+    # Audit
+    client_ip = request.client.host if request.client else None
     log_audit(
         db, current_user.id, "ASSIGN_PATIENT",
         resource="patients", resource_id=patient.id,
@@ -1350,6 +1379,1113 @@ async def admin_assign_patient(
     )
 
     return {"success": True, "message": f"Patient {patient.name} assigned to doctor {new_doctor_id}"}
+
+
+# ─────────────────────────────────────────────────────────
+# Phase 1: E-Prescriptions & Medications Endpoints
+# ─────────────────────────────────────────────────────────
+
+class PrescriptionItemCreate(BaseModel):
+    medication_id: Optional[int] = None
+    medication_name: str
+    generic_name: Optional[str] = None
+    dose: str
+    frequency: str
+    timing: Optional[str] = None
+    duration: Optional[str] = None
+    instructions_ar: Optional[str] = None
+
+class PrescriptionCreate(BaseModel):
+    patient_id: int
+    diagnosis: Optional[str] = None
+    notes: Optional[str] = None
+    follow_up_date: Optional[str] = None
+    items: List[PrescriptionItemCreate]
+
+class MedicationCreate(BaseModel):
+    trade_name: str
+    generic_name: str
+    category: Optional[str] = None
+    dosage_forms: Optional[List[str]] = None
+    default_dose: Optional[str] = None
+    default_freq: Optional[str] = None
+    timing: Optional[str] = None
+    notes_ar: Optional[str] = None
+    liver_warning: Optional[str] = None
+    is_liver_safe: Optional[int] = 1
+    common_in_iraq: Optional[int] = 1
+
+
+@app.get("/medications")
+async def get_medications(
+    q: Optional[str] = None,
+    category: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    query = db.query(Medication)
+    if category:
+        query = query.filter(Medication.category == category)
+    if q:
+        search = f"%{q}%"
+        query = query.filter(
+            (Medication.trade_name.ilike(search)) | (Medication.generic_name.ilike(search))
+        )
+    meds = query.order_by(Medication.trade_name.asc()).all()
+    
+    result = []
+    for m in meds:
+        dosage_forms_list = []
+        if m.dosage_forms:
+            try:
+                dosage_forms_list = json.loads(m.dosage_forms)
+            except Exception:
+                dosage_forms_list = [m.dosage_forms]
+        result.append({
+            "id": m.id,
+            "trade_name": m.trade_name,
+            "generic_name": m.generic_name,
+            "category": m.category,
+            "dosage_forms": dosage_forms_list,
+            "default_dose": m.default_dose,
+            "default_freq": m.default_freq,
+            "timing": m.timing,
+            "notes_ar": m.notes_ar,
+            "liver_warning": m.liver_warning,
+            "is_liver_safe": bool(m.is_liver_safe),
+            "common_in_iraq": bool(m.common_in_iraq),
+        })
+    return {"success": True, "medications": result}
+
+
+@app.post("/medications")
+async def create_medication(
+    med_in: MedicationCreate,
+    db: Session = Depends(get_db),
+    current_user: User = require_permission("can_manage_prescriptions")
+):
+    new_med = Medication(
+        trade_name=med_in.trade_name,
+        generic_name=med_in.generic_name,
+        category=med_in.category,
+        dosage_forms=json.dumps(med_in.dosage_forms) if med_in.dosage_forms else None,
+        default_dose=med_in.default_dose,
+        default_freq=med_in.default_freq,
+        timing=med_in.timing,
+        notes_ar=med_in.notes_ar,
+        liver_warning=med_in.liver_warning,
+        is_liver_safe=med_in.is_liver_safe if med_in.is_liver_safe is not None else 1,
+        common_in_iraq=med_in.common_in_iraq if med_in.common_in_iraq is not None else 1
+    )
+    db.add(new_med)
+    db.commit()
+    db.refresh(new_med)
+    return {"success": True, "medication_id": new_med.id}
+
+
+@app.get("/prescriptions")
+async def get_prescriptions(
+    patient_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    query = db.query(Prescription)
+    if not _is_admin(current_user):
+        query = query.filter(Prescription.doctor_id == current_user.id)
+    if patient_id:
+        query = query.filter(Prescription.patient_id == patient_id)
+        
+    prescriptions = query.order_by(desc(Prescription.created_at)).all()
+    
+    result = []
+    for rx in prescriptions:
+        patient = rx.patient
+        doctor = rx.doctor
+        result.append({
+            "id": rx.id,
+            "prescription_number": rx.prescription_number,
+            "patient_id": rx.patient_id,
+            "patient_name": patient.name if patient else "Unknown",
+            "patient_code": patient.patient_id if patient else "",
+            "patient_birth_date": patient.birth_date if patient else None,
+            "patient_phone": patient.phone if patient else None,
+            "doctor_id": rx.doctor_id,
+            "doctor_name": doctor.full_name if doctor and doctor.full_name else (doctor.username if doctor else "Unknown"),
+            "diagnosis": rx.diagnosis,
+            "notes": rx.notes,
+            "follow_up_date": rx.follow_up_date,
+            "status": rx.status,
+            "item_count": len(rx.items),
+            "created_at": rx.created_at.isoformat() if rx.created_at else None,
+        })
+    return {"success": True, "prescriptions": result}
+
+
+@app.post("/prescriptions")
+async def create_prescription(
+    rx_in: PrescriptionCreate,
+    db: Session = Depends(get_db),
+    current_user: User = require_permission("can_manage_prescriptions")
+):
+    patient = db.query(Patient).filter(Patient.id == rx_in.patient_id).first()
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    date_str = datetime.now().strftime("%Y%m%d")
+    count_today = db.query(Prescription).filter(
+        Prescription.prescription_number.like(f"RX-{date_str}-%")
+    ).count()
+    rx_number = f"RX-{date_str}-{count_today + 1:03d}"
+
+    new_rx = Prescription(
+        prescription_number=rx_number,
+        patient_id=patient.id,
+        doctor_id=current_user.id,
+        diagnosis=rx_in.diagnosis,
+        notes=rx_in.notes,
+        follow_up_date=rx_in.follow_up_date,
+        status="active"
+    )
+    db.add(new_rx)
+    db.flush()
+
+    for item in rx_in.items:
+        p_item = PrescriptionItem(
+            prescription_id=new_rx.id,
+            medication_id=item.medication_id,
+            medication_name=item.medication_name,
+            generic_name=item.generic_name,
+            dose=item.dose,
+            frequency=item.frequency,
+            timing=item.timing,
+            duration=item.duration,
+            instructions_ar=item.instructions_ar
+        )
+        db.add(p_item)
+
+    db.commit()
+    db.refresh(new_rx)
+
+    return {
+        "success": True,
+        "prescription_id": new_rx.id,
+        "prescription_number": new_rx.prescription_number,
+        "message": "Prescription created successfully"
+    }
+
+
+@app.get("/prescriptions/{prescription_id}")
+async def get_prescription_by_id(
+    prescription_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    rx = db.query(Prescription).filter(Prescription.id == prescription_id).first()
+    if not rx:
+        raise HTTPException(status_code=404, detail="Prescription not found")
+        
+    if not _is_admin(current_user) and rx.doctor_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access forbidden")
+
+    patient = rx.patient
+    doctor = rx.doctor
+    
+    items = []
+    for it in rx.items:
+        items.append({
+            "id": it.id,
+            "medication_id": it.medication_id,
+            "medication_name": it.medication_name,
+            "generic_name": it.generic_name,
+            "dose": it.dose,
+            "frequency": it.frequency,
+            "timing": it.timing,
+            "duration": it.duration,
+            "instructions_ar": it.instructions_ar,
+        })
+
+    return {
+        "success": True,
+        "prescription": {
+            "id": rx.id,
+            "prescription_number": rx.prescription_number,
+            "patient_id": rx.patient_id,
+            "patient_name": patient.name if patient else "Unknown",
+            "patient_code": patient.patient_id if patient else "",
+            "patient_birth_date": patient.birth_date if patient else None,
+            "patient_phone": patient.phone if patient else None,
+            "doctor_id": rx.doctor_id,
+            "doctor_name": doctor.full_name if doctor and doctor.full_name else (doctor.username if doctor else "Unknown"),
+            "diagnosis": rx.diagnosis,
+            "notes": rx.notes,
+            "follow_up_date": rx.follow_up_date,
+            "status": rx.status,
+            "created_at": rx.created_at.isoformat() if rx.created_at else None,
+            "items": items
+        }
+    }
+
+
+@app.delete("/prescriptions/{prescription_id}")
+async def delete_prescription(
+    prescription_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = require_permission("can_manage_prescriptions")
+):
+    rx = db.query(Prescription).filter(Prescription.id == prescription_id).first()
+    if not rx:
+        raise HTTPException(status_code=404, detail="Prescription not found")
+        
+    if not _is_admin(current_user) and rx.doctor_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access forbidden")
+
+    db.delete(rx)
+    db.commit()
+    return {"success": True, "message": "Prescription deleted"}
+
+
+# ─────────────────────────────────────────────────────────
+# Phase 3: Clinical Notes (SOAP) & Chronic Conditions Endpoints
+# ─────────────────────────────────────────────────────────
+
+class ClinicalNoteCreate(BaseModel):
+    patient_id: int
+    visit_type: Optional[str] = "follow_up" # new, follow_up, routine
+    subjective: Optional[str] = None
+    objective: Optional[str] = None
+    assessment: Optional[str] = None
+    plan: Optional[str] = None
+    blood_pressure: Optional[str] = None
+    heart_rate: Optional[int] = None
+    weight: Optional[float] = None
+    temperature: Optional[float] = None
+    jaundice: Optional[str] = "None"
+    ascites: Optional[str] = "None"
+    edema: Optional[str] = "None"
+    hepatomegaly: Optional[int] = 0
+    splenomegaly: Optional[int] = 0
+    spider_angioma: Optional[int] = 0
+    asterixis: Optional[int] = 0
+    follow_up_date: Optional[str] = None
+
+
+class ClinicalNoteUpdate(BaseModel):
+    visit_type: Optional[str] = None
+    subjective: Optional[str] = None
+    objective: Optional[str] = None
+    assessment: Optional[str] = None
+    plan: Optional[str] = None
+    blood_pressure: Optional[str] = None
+    heart_rate: Optional[int] = None
+    weight: Optional[float] = None
+    temperature: Optional[float] = None
+    jaundice: Optional[str] = None
+    ascites: Optional[str] = None
+    edema: Optional[str] = None
+    hepatomegaly: Optional[int] = None
+    splenomegaly: Optional[int] = None
+    spider_angioma: Optional[int] = None
+    asterixis: Optional[int] = None
+    follow_up_date: Optional[str] = None
+
+
+def _format_clinical_note(note: ClinicalNote) -> dict:
+    patient = note.patient
+    doctor = note.doctor
+    return {
+        "id": note.id,
+        "patient_id": note.patient_id,
+        "patient_name": patient.name if patient else "Unknown",
+        "patient_code": patient.patient_id if patient else "",
+        "patient_birth_date": patient.birth_date if patient else None,
+        "patient_phone": patient.phone if patient else None,
+        "doctor_id": note.doctor_id,
+        "doctor_name": doctor.full_name if doctor and doctor.full_name else (doctor.username if doctor else "Attending Physician"),
+        "visit_date": note.visit_date.isoformat() if note.visit_date else None,
+        "visit_type": note.visit_type or "follow_up",
+        "subjective": note.subjective or "",
+        "objective": note.objective or "",
+        "assessment": note.assessment or "",
+        "plan": note.plan or "",
+        "blood_pressure": note.blood_pressure or "",
+        "heart_rate": note.heart_rate,
+        "weight": note.weight,
+        "temperature": note.temperature,
+        "jaundice": note.jaundice or "None",
+        "ascites": note.ascites or "None",
+        "edema": note.edema or "None",
+        "hepatomegaly": bool(note.hepatomegaly),
+        "splenomegaly": bool(note.splenomegaly),
+        "spider_angioma": bool(note.spider_angioma),
+        "asterixis": bool(note.asterixis),
+        "follow_up_date": note.follow_up_date,
+        "created_at": note.created_at.isoformat() if note.created_at else None,
+        "updated_at": note.updated_at.isoformat() if note.updated_at else None,
+    }
+
+
+@app.get("/clinical-notes")
+async def get_clinical_notes(
+    patient_id: Optional[Union[int, str]] = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    query = db.query(ClinicalNote)
+    if not _is_admin(current_user):
+        query = query.filter(ClinicalNote.doctor_id == current_user.id)
+
+    if patient_id is not None:
+        try:
+            pid_int = int(patient_id)
+            query = query.filter(ClinicalNote.patient_id == pid_int)
+        except ValueError:
+            # Match by string patient_id e.g. "P-001"
+            p = db.query(Patient).filter(Patient.patient_id == str(patient_id)).first()
+            if p:
+                query = query.filter(ClinicalNote.patient_id == p.id)
+            else:
+                return {"success": True, "notes": []}
+
+    notes = query.order_by(desc(ClinicalNote.created_at)).limit(limit).all()
+    results = [_format_clinical_note(n) for n in notes]
+    return {"success": True, "notes": results}
+
+
+@app.post("/clinical-notes")
+async def create_clinical_note(
+    note_in: ClinicalNoteCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    # Check patient exists
+    patient = db.query(Patient).filter(Patient.id == note_in.patient_id).first()
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    new_note = ClinicalNote(
+        patient_id=note_in.patient_id,
+        doctor_id=current_user.id,
+        visit_type=note_in.visit_type or "follow_up",
+        subjective=note_in.subjective,
+        objective=note_in.objective,
+        assessment=note_in.assessment,
+        plan=note_in.plan,
+        blood_pressure=note_in.blood_pressure,
+        heart_rate=note_in.heart_rate,
+        weight=note_in.weight,
+        temperature=note_in.temperature,
+        jaundice=note_in.jaundice,
+        ascites=note_in.ascites,
+        edema=note_in.edema,
+        hepatomegaly=note_in.hepatomegaly or 0,
+        splenomegaly=note_in.splenomegaly or 0,
+        spider_angioma=note_in.spider_angioma or 0,
+        asterixis=note_in.asterixis or 0,
+        follow_up_date=note_in.follow_up_date,
+    )
+
+    db.add(new_note)
+    db.commit()
+    db.refresh(new_note)
+
+    log_audit(
+        db,
+        user_id=current_user.id,
+        action="CREATE_CLINICAL_NOTE",
+        resource="clinical_notes",
+        resource_id=new_note.id,
+        details={"patient_id": patient.id, "patient_code": patient.patient_id}
+    )
+
+    return {
+        "success": True,
+        "note": _format_clinical_note(new_note),
+        "message": "Clinical note saved successfully"
+    }
+
+
+@app.get("/clinical-notes/{note_id}")
+async def get_clinical_note_by_id(
+    note_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    note = db.query(ClinicalNote).filter(ClinicalNote.id == note_id).first()
+    if not note:
+        raise HTTPException(status_code=404, detail="Clinical note not found")
+
+    if not _is_admin(current_user) and note.doctor_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access forbidden")
+
+    return {
+        "success": True,
+        "note": _format_clinical_note(note)
+    }
+
+
+@app.put("/clinical-notes/{note_id}")
+async def update_clinical_note(
+    note_id: int,
+    note_in: ClinicalNoteUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    note = db.query(ClinicalNote).filter(ClinicalNote.id == note_id).first()
+    if not note:
+        raise HTTPException(status_code=404, detail="Clinical note not found")
+
+    if not _is_admin(current_user) and note.doctor_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access forbidden")
+
+    update_dict = note_in.dict(exclude_unset=True)
+    for field, val in update_dict.items():
+        setattr(note, field, val)
+
+    db.commit()
+    db.refresh(note)
+
+    return {
+        "success": True,
+        "note": _format_clinical_note(note),
+        "message": "Clinical note updated successfully"
+    }
+
+
+@app.delete("/clinical-notes/{note_id}")
+async def delete_clinical_note(
+    note_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    note = db.query(ClinicalNote).filter(ClinicalNote.id == note_id).first()
+    if not note:
+        raise HTTPException(status_code=404, detail="Clinical note not found")
+
+    if not _is_admin(current_user) and note.doctor_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access forbidden")
+
+    db.delete(note)
+    db.commit()
+    return {"success": True, "message": "Clinical note deleted"}
+
+
+class ChronicConditionsUpdate(BaseModel):
+    conditions: List[Dict[str, Any]]
+
+
+@app.get("/patients/{patient_id}/chronic-conditions")
+async def get_patient_chronic_conditions(
+    patient_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    try:
+        pid = int(patient_id)
+        patient = db.query(Patient).filter(Patient.id == pid).first()
+    except ValueError:
+        patient = db.query(Patient).filter(Patient.patient_id == patient_id).first()
+
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    conditions = []
+    if patient.chronic_conditions:
+        try:
+            conditions = json.loads(patient.chronic_conditions)
+        except Exception:
+            conditions = [{"name": patient.chronic_conditions, "status": "active"}]
+
+    return {"success": True, "conditions": conditions}
+
+
+@app.put("/patients/{patient_id}/chronic-conditions")
+async def update_patient_chronic_conditions(
+    patient_id: str,
+    body: ChronicConditionsUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    try:
+        pid = int(patient_id)
+        patient = db.query(Patient).filter(Patient.id == pid).first()
+    except ValueError:
+        patient = db.query(Patient).filter(Patient.patient_id == patient_id).first()
+
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    if not _is_admin(current_user) and patient.doctor_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not your patient")
+
+    patient.chronic_conditions = json.dumps(body.conditions, ensure_ascii=False)
+    db.commit()
+    db.refresh(patient)
+
+    return {
+        "success": True,
+        "conditions": body.conditions,
+        "message": "Chronic conditions updated successfully"
+    }
+
+
+# ─────────────────────────────────────────────────────────
+# Phase 5: Liver Ultrasound, FibroScan & Imaging Endpoints
+# ─────────────────────────────────────────────────────────
+
+class UltrasoundExamCreate(BaseModel):
+    patient_id: int
+    exam_date: Optional[str] = None
+    exam_type: Optional[str] = "ultrasound"  # ultrasound, fibroscan, ct, mri
+    liver_size: Optional[str] = "Normal"     # Normal, Hepatomegaly, Shrunken / Atrophic
+    echogenicity: Optional[str] = "Normal"   # Normal, Grade I Mild Fatty, Grade II Moderate Fatty, Grade III Severe Fatty, Coarse / Cirrhotic
+    surface_contour: Optional[str] = "Smooth" # Smooth, Irregular / Nodular
+    portal_vein_mm: Optional[float] = None
+    portal_flow: Optional[str] = "Normal"
+    spleen_size_cm: Optional[float] = None
+    ascites: Optional[str] = "None"          # None, Mild, Moderate, Severe
+    focal_lesion: Optional[str] = "None"     # None, Cyst, Hemangioma, Suspicious HCC, Multiple Nodules
+    focal_lesion_desc: Optional[str] = None
+    gallbladder: Optional[str] = "Normal"    # Normal, Stones, Sludge, Thickened Wall, Removed
+    cbd_diameter_mm: Optional[float] = None
+    fibroscan_kpa: Optional[float] = None
+    fibroscan_cap: Optional[float] = None
+    fibrosis_stage: Optional[str] = None
+    steatosis_grade: Optional[str] = None
+    impression: Optional[str] = None
+    recommendations: Optional[str] = None
+    image_urls: Optional[List[str]] = None
+
+
+class UltrasoundExamUpdate(BaseModel):
+    exam_date: Optional[str] = None
+    exam_type: Optional[str] = None
+    liver_size: Optional[str] = None
+    echogenicity: Optional[str] = None
+    surface_contour: Optional[str] = None
+    portal_vein_mm: Optional[float] = None
+    portal_flow: Optional[str] = None
+    spleen_size_cm: Optional[float] = None
+    ascites: Optional[str] = None
+    focal_lesion: Optional[str] = None
+    focal_lesion_desc: Optional[str] = None
+    gallbladder: Optional[str] = None
+    cbd_diameter_mm: Optional[float] = None
+    fibroscan_kpa: Optional[float] = None
+    fibroscan_cap: Optional[float] = None
+    fibrosis_stage: Optional[str] = None
+    steatosis_grade: Optional[str] = None
+    impression: Optional[str] = None
+    recommendations: Optional[str] = None
+    image_urls: Optional[List[str]] = None
+
+
+def _format_ultrasound_exam(exam: UltrasoundExam) -> dict:
+    patient = exam.patient
+    doctor = exam.doctor
+    images = []
+    if exam.image_urls:
+        try:
+            images = json.loads(exam.image_urls)
+        except Exception:
+            images = [exam.image_urls]
+    return {
+        "id": exam.id,
+        "patient_id": exam.patient_id,
+        "patient_name": patient.name if patient else "Unknown",
+        "patient_code": patient.patient_id if patient else "",
+        "doctor_id": exam.doctor_id,
+        "doctor_name": doctor.full_name if doctor and doctor.full_name else (doctor.username if doctor else "Attending Physician"),
+        "exam_date": exam.exam_date.isoformat() if exam.exam_date else None,
+        "exam_type": exam.exam_type or "ultrasound",
+        "liver_size": exam.liver_size or "Normal",
+        "echogenicity": exam.echogenicity or "Normal",
+        "surface_contour": exam.surface_contour or "Smooth",
+        "portal_vein_mm": exam.portal_vein_mm,
+        "portal_flow": exam.portal_flow or "Normal",
+        "spleen_size_cm": exam.spleen_size_cm,
+        "ascites": exam.ascites or "None",
+        "focal_lesion": exam.focal_lesion or "None",
+        "focal_lesion_desc": exam.focal_lesion_desc or "",
+        "gallbladder": exam.gallbladder or "Normal",
+        "cbd_diameter_mm": exam.cbd_diameter_mm,
+        "fibroscan_kpa": exam.fibroscan_kpa,
+        "fibroscan_cap": exam.fibroscan_cap,
+        "fibrosis_stage": exam.fibrosis_stage or "",
+        "steatosis_grade": exam.steatosis_grade or "",
+        "impression": exam.impression or "",
+        "recommendations": exam.recommendations or "",
+        "image_urls": images,
+        "created_at": exam.created_at.isoformat() if exam.created_at else None,
+        "updated_at": exam.updated_at.isoformat() if exam.updated_at else None,
+    }
+
+
+@app.get("/ultrasounds")
+async def get_ultrasound_exams(
+    patient_id: Optional[Union[int, str]] = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    query = db.query(UltrasoundExam)
+    if not _is_admin(current_user):
+        query = query.filter(UltrasoundExam.doctor_id == current_user.id)
+
+    if patient_id is not None:
+        try:
+            pid_int = int(patient_id)
+            query = query.filter(UltrasoundExam.patient_id == pid_int)
+        except ValueError:
+            p = db.query(Patient).filter(Patient.patient_id == str(patient_id)).first()
+            if p:
+                query = query.filter(UltrasoundExam.patient_id == p.id)
+            else:
+                return {"success": True, "exams": []}
+
+    exams = query.order_by(desc(UltrasoundExam.created_at)).limit(limit).all()
+    results = [_format_ultrasound_exam(e) for e in exams]
+    return {"success": True, "exams": results}
+
+
+@app.post("/ultrasounds")
+async def create_ultrasound_exam(
+    exam_in: UltrasoundExamCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    patient = db.query(Patient).filter(Patient.id == exam_in.patient_id).first()
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    if not _is_admin(current_user) and patient.doctor_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to document exam for this patient")
+
+    fibrosis_stage = exam_in.fibrosis_stage
+    if exam_in.fibroscan_kpa is not None and not fibrosis_stage:
+        kpa = exam_in.fibroscan_kpa
+        if kpa < 7.0:
+            fibrosis_stage = "F0-F1"
+        elif kpa < 9.5:
+            fibrosis_stage = "F2"
+        elif kpa < 12.5:
+            fibrosis_stage = "F3"
+        else:
+            fibrosis_stage = "F4 (Cirrhosis)"
+
+    steatosis_grade = exam_in.steatosis_grade
+    if exam_in.fibroscan_cap is not None and not steatosis_grade:
+        cap = exam_in.fibroscan_cap
+        if cap < 248:
+            steatosis_grade = "S0 (Normal)"
+        elif cap < 268:
+            steatosis_grade = "S1 (Mild)"
+        elif cap < 280:
+            steatosis_grade = "S2 (Moderate)"
+        else:
+            steatosis_grade = "S3 (Severe)"
+
+    img_json = json.dumps(exam_in.image_urls) if exam_in.image_urls else None
+
+    exam_date = datetime.now()
+    if exam_in.exam_date:
+        try:
+            exam_date = datetime.fromisoformat(exam_in.exam_date.replace("Z", "+00:00"))
+        except Exception:
+            pass
+
+    new_exam = UltrasoundExam(
+        patient_id=exam_in.patient_id,
+        doctor_id=current_user.id,
+        exam_date=exam_date,
+        exam_type=exam_in.exam_type or "ultrasound",
+        liver_size=exam_in.liver_size or "Normal",
+        echogenicity=exam_in.echogenicity or "Normal",
+        surface_contour=exam_in.surface_contour or "Smooth",
+        portal_vein_mm=exam_in.portal_vein_mm,
+        portal_flow=exam_in.portal_flow or "Normal",
+        spleen_size_cm=exam_in.spleen_size_cm,
+        ascites=exam_in.ascites or "None",
+        focal_lesion=exam_in.focal_lesion or "None",
+        focal_lesion_desc=exam_in.focal_lesion_desc,
+        gallbladder=exam_in.gallbladder or "Normal",
+        cbd_diameter_mm=exam_in.cbd_diameter_mm,
+        fibroscan_kpa=exam_in.fibroscan_kpa,
+        fibroscan_cap=exam_in.fibroscan_cap,
+        fibrosis_stage=fibrosis_stage,
+        steatosis_grade=steatosis_grade,
+        impression=exam_in.impression,
+        recommendations=exam_in.recommendations,
+        image_urls=img_json,
+    )
+
+    db.add(new_exam)
+    db.commit()
+    db.refresh(new_exam)
+
+    return {
+        "success": True,
+        "message": "Ultrasound / imaging examination saved successfully",
+        "exam": _format_ultrasound_exam(new_exam)
+    }
+
+
+@app.get("/ultrasounds/{exam_id}")
+async def get_ultrasound_exam(
+    exam_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    exam = db.query(UltrasoundExam).filter(UltrasoundExam.id == exam_id).first()
+    if not exam:
+        raise HTTPException(status_code=404, detail="Exam not found")
+
+    if not _is_admin(current_user) and exam.doctor_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access forbidden")
+
+    return {"success": True, "exam": _format_ultrasound_exam(exam)}
+
+
+@app.put("/ultrasounds/{exam_id}")
+async def update_ultrasound_exam(
+    exam_id: int,
+    exam_in: UltrasoundExamUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    exam = db.query(UltrasoundExam).filter(UltrasoundExam.id == exam_id).first()
+    if not exam:
+        raise HTTPException(status_code=404, detail="Exam not found")
+
+    if not _is_admin(current_user) and exam.doctor_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access forbidden")
+
+    data = exam_in.dict(exclude_unset=True)
+    if "image_urls" in data and data["image_urls"] is not None:
+        data["image_urls"] = json.dumps(data["image_urls"])
+
+    for field, val in data.items():
+        if val is not None:
+            setattr(exam, field, val)
+
+    db.commit()
+    db.refresh(exam)
+    return {"success": True, "message": "Exam updated successfully", "exam": _format_ultrasound_exam(exam)}
+
+
+@app.delete("/ultrasounds/{exam_id}")
+async def delete_ultrasound_exam(
+    exam_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    exam = db.query(UltrasoundExam).filter(UltrasoundExam.id == exam_id).first()
+    if not exam:
+        raise HTTPException(status_code=404, detail="Exam not found")
+
+    if not _is_admin(current_user) and exam.doctor_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access forbidden")
+
+    db.delete(exam)
+    db.commit()
+    return {"success": True, "message": "Exam deleted successfully"}
+
+
+@app.post("/ultrasounds/upload")
+async def upload_ultrasound_image(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user)
+):
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in [".jpg", ".jpeg", ".png", ".webp", ".pdf", ".dcm"]:
+        raise HTTPException(status_code=400, detail="Invalid file type. Allowed: JPG, PNG, WEBP, PDF, DCM")
+
+    unique_filename = f"{uuid.uuid4().hex[:12]}_{os.path.basename(file.filename)}"
+    save_path = os.path.join(UPLOAD_DIR, "imaging", unique_filename)
+
+    with open(save_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    return {
+        "success": True,
+        "url": f"/uploads/imaging/{unique_filename}",
+        "filename": file.filename
+    }
+
+
+# ─────────────────────────────────────────────────────────
+# Phase 6: Clinic Billing & Daily Financial Endpoints
+# ─────────────────────────────────────────────────────────
+
+class BillingCreate(BaseModel):
+    patient_id: int
+    visit_date: Optional[str] = None
+    visit_type: str = "new_consultation"
+    fee_iqd: int = 25000
+    discount_iqd: int = 0
+    final_iqd: Optional[int] = None
+    is_paid: int = 1
+    payment_method: str = "cash"
+    notes: Optional[str] = None
+
+class BillingUpdate(BaseModel):
+    visit_type: Optional[str] = None
+    fee_iqd: Optional[int] = None
+    discount_iqd: Optional[int] = None
+    final_iqd: Optional[int] = None
+    is_paid: Optional[int] = None
+    payment_method: Optional[str] = None
+    notes: Optional[str] = None
+
+def _format_billing_record(b: ClinicBilling) -> dict:
+    return {
+        "id": b.id,
+        "bill_number": b.bill_number,
+        "patient_id": b.patient_id,
+        "patient_name": b.patient_name,
+        "patient_code": b.patient_code,
+        "doctor_id": b.doctor_id,
+        "doctor_name": b.doctor_name,
+        "visit_date": b.visit_date.isoformat() if b.visit_date else None,
+        "visit_type": b.visit_type,
+        "fee_iqd": b.fee_iqd,
+        "discount_iqd": b.discount_iqd,
+        "final_iqd": b.final_iqd,
+        "is_paid": bool(b.is_paid),
+        "payment_method": b.payment_method,
+        "notes": b.notes,
+        "created_at": b.created_at.isoformat() if b.created_at else None,
+        "updated_at": b.updated_at.isoformat() if b.updated_at else None,
+    }
+
+def _generate_bill_number(db: Session) -> str:
+    current_year = datetime.now().year
+    prefix = f"INV-{current_year}-"
+    last = db.query(ClinicBilling).filter(ClinicBilling.bill_number.like(f"{prefix}%")).order_by(desc(ClinicBilling.id)).first()
+    if last and last.bill_number:
+        try:
+            seq = int(last.bill_number.split("-")[-1]) + 1
+        except Exception:
+            seq = 1
+    else:
+        seq = 1
+    return f"{prefix}{seq:04d}"
+
+@app.get("/billing")
+async def get_billing_records(
+    patient_id: Optional[int] = None,
+    date: Optional[str] = None, # YYYY-MM-DD
+    start_date: Optional[str] = None, # YYYY-MM-DD
+    end_date: Optional[str] = None, # YYYY-MM-DD
+    is_paid: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    query = db.query(ClinicBilling)
+
+    if not _is_admin(current_user):
+        query = query.filter(ClinicBilling.doctor_id == current_user.id)
+
+    if patient_id is not None:
+        query = query.filter(ClinicBilling.patient_id == patient_id)
+
+    if date:
+        try:
+            target_date = datetime.strptime(date, "%Y-%m-%d").date()
+            query = query.filter(func.date(ClinicBilling.visit_date) == target_date)
+        except Exception:
+            pass
+    elif start_date or end_date:
+        if start_date:
+            try:
+                s_date = datetime.strptime(start_date, "%Y-%m-%d").date()
+                query = query.filter(func.date(ClinicBilling.visit_date) >= s_date)
+            except Exception:
+                pass
+        if end_date:
+            try:
+                e_date = datetime.strptime(end_date, "%Y-%m-%d").date()
+                query = query.filter(func.date(ClinicBilling.visit_date) <= e_date)
+            except Exception:
+                pass
+
+    if is_paid is not None:
+        query = query.filter(ClinicBilling.is_paid == is_paid)
+
+    records = query.order_by(desc(ClinicBilling.visit_date)).all()
+    return [_format_billing_record(r) for r in records]
+
+@app.get("/billing/summary")
+async def get_billing_summary(
+    date: Optional[str] = None, # YYYY-MM-DD
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    secretary_split: float = 20.0, # percentage e.g. 20%
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    query = db.query(ClinicBilling)
+
+    if not _is_admin(current_user):
+        query = query.filter(ClinicBilling.doctor_id == current_user.id)
+
+    if date:
+        try:
+            target_date = datetime.strptime(date, "%Y-%m-%d").date()
+            query = query.filter(func.date(ClinicBilling.visit_date) == target_date)
+        except Exception:
+            pass
+    elif start_date or end_date:
+        if start_date:
+            try:
+                s_date = datetime.strptime(start_date, "%Y-%m-%d").date()
+                query = query.filter(func.date(ClinicBilling.visit_date) >= s_date)
+            except Exception:
+                pass
+        if end_date:
+            try:
+                e_date = datetime.strptime(end_date, "%Y-%m-%d").date()
+                query = query.filter(func.date(ClinicBilling.visit_date) <= e_date)
+            except Exception:
+                pass
+
+    records = query.all()
+
+    total_bills = len(records)
+    total_gross = sum(r.fee_iqd for r in records)
+    total_discount = sum(r.discount_iqd for r in records)
+    total_collected = sum(r.final_iqd for r in records if r.is_paid)
+    pending_amount = sum(r.final_iqd for r in records if not r.is_paid)
+    paid_count = sum(1 for r in records if r.is_paid)
+    pending_count = sum(1 for r in records if not r.is_paid)
+
+    # Breakdown by visit_type
+    types_breakdown = {}
+    for r in records:
+        vt = r.visit_type or "other"
+        if vt not in types_breakdown:
+            types_breakdown[vt] = {"count": 0, "total_iqd": 0}
+        types_breakdown[vt]["count"] += 1
+        types_breakdown[vt]["total_iqd"] += (r.final_iqd if r.is_paid else 0)
+
+    # Breakdown by payment method
+    methods_breakdown = {}
+    for r in records:
+        pm = r.payment_method or "cash"
+        if pm not in methods_breakdown:
+            methods_breakdown[pm] = {"count": 0, "total_iqd": 0}
+        methods_breakdown[pm]["count"] += 1
+        methods_breakdown[pm]["total_iqd"] += (r.final_iqd if r.is_paid else 0)
+
+    # Secretary and Doctor Split calculations
+    secretary_cut = int(total_collected * (secretary_split / 100.0))
+    doctor_net = total_collected - secretary_cut
+
+    return {
+        "total_bills": total_bills,
+        "paid_count": paid_count,
+        "pending_count": pending_count,
+        "total_gross_iqd": total_gross,
+        "total_discount_iqd": total_discount,
+        "total_collected_iqd": total_collected,
+        "pending_amount_iqd": pending_amount,
+        "secretary_split_percent": secretary_split,
+        "secretary_share_iqd": secretary_cut,
+        "doctor_net_iqd": doctor_net,
+        "by_visit_type": types_breakdown,
+        "by_payment_method": methods_breakdown,
+    }
+
+@app.post("/billing")
+async def create_billing_record(
+    b_in: BillingCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    patient = db.query(Patient).filter(Patient.id == b_in.patient_id).first()
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    bill_num = _generate_bill_number(db)
+    
+    calculated_final = b_in.final_iqd if b_in.final_iqd is not None else max(0, b_in.fee_iqd - b_in.discount_iqd)
+
+    if b_in.visit_date:
+        try:
+            v_date = datetime.fromisoformat(b_in.visit_date.replace("Z", "+00:00"))
+        except Exception:
+            try:
+                v_date = datetime.strptime(b_in.visit_date, "%Y-%m-%d")
+            except Exception:
+                v_date = datetime.now()
+    else:
+        v_date = datetime.now()
+
+    new_bill = ClinicBilling(
+        bill_number=bill_num,
+        patient_id=patient.id,
+        patient_name=patient.name,
+        patient_code=patient.patient_id,
+        doctor_id=current_user.id,
+        doctor_name=current_user.full_name or current_user.username,
+        visit_date=v_date,
+        visit_type=b_in.visit_type,
+        fee_iqd=b_in.fee_iqd,
+        discount_iqd=b_in.discount_iqd,
+        final_iqd=calculated_final,
+        is_paid=b_in.is_paid,
+        payment_method=b_in.payment_method,
+        notes=b_in.notes
+    )
+
+    db.add(new_bill)
+    db.commit()
+    db.refresh(new_bill)
+
+    return {"success": True, "message": "Bill created successfully", "bill": _format_billing_record(new_bill)}
+
+@app.put("/billing/{bill_id}")
+async def update_billing_record(
+    bill_id: int,
+    b_in: BillingUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    bill = db.query(ClinicBilling).filter(ClinicBilling.id == bill_id).first()
+    if not bill:
+        raise HTTPException(status_code=404, detail="Bill record not found")
+
+    if not _is_admin(current_user) and bill.doctor_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access forbidden")
+
+    data = b_in.dict(exclude_unset=True)
+    for field, val in data.items():
+        if val is not None:
+            setattr(bill, field, val)
+
+    if "final_iqd" not in data and ("fee_iqd" in data or "discount_iqd" in data):
+        bill.final_iqd = max(0, bill.fee_iqd - bill.discount_iqd)
+
+    db.commit()
+    db.refresh(bill)
+    return {"success": True, "message": "Bill updated successfully", "bill": _format_billing_record(bill)}
+
+@app.delete("/billing/{bill_id}")
+async def delete_billing_record(
+    bill_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    bill = db.query(ClinicBilling).filter(ClinicBilling.id == bill_id).first()
+    if not bill:
+        raise HTTPException(status_code=404, detail="Bill record not found")
+
+    if not _is_admin(current_user) and bill.doctor_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access forbidden")
+
+    db.delete(bill)
+    db.commit()
+    return {"success": True, "message": "Bill deleted successfully"}
 
 
 if __name__ == "__main__":
